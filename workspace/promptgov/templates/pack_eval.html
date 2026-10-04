@@ -37,16 +37,23 @@
   <div class="card">
     <h2>审批记录（归档快照）</h2>
     <table>
+      <thead><tr><th>类型</th><th>结论/状态</th><th>覆盖工具</th><th>有效期</th>
+      <th>审批人</th><th>时间</th></tr></thead>
       <tbody>
       {% for a in approvals %}
         <tr><td><span class="chip">{{ a.kind }}</span></td>
           <td>{% if a.decision == 'approved' %}<span class="ok">{{ a.decision }}</span>
-            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}</td>
+            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}
+            {% if a.decision == 'approved' %}
+            <br><span class="badge b-{{ a.state }}">{{ a.state }}</span>{% endif %}</td>
+          <td class="small mono">{{ a.granted_tools }}</td>
+          <td class="small">{% if a.is_permanent %}永久
+            {% else %}{{ a.valid_from or '即刻' }} ~ {{ a.valid_until or '永久' }}{% endif %}
+            {% if a.revoked_at %}<br><span class="bad">已撤销 {{ a.revoked_at }}</span>{% endif %}</td>
           <td class="small">{{ a.approver }}</td>
-          <td class="small mut">{{ a.reason }}</td>
           <td class="small">{{ a.created_at }}</td></tr>
       {% endfor %}
-      {% if not approvals %}<tr><td colspan="5" class="small mut">无审批记录。</td></tr>{% endif %}
+      {% if not approvals %}<tr><td colspan="6" class="small mut">无审批记录。</td></tr>{% endif %}
       </tbody>
     </table>
   </div>

@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS approvals (
     approver         TEXT NOT NULL,
     reason           TEXT NOT NULL DEFAULT '',
     granted_tools    TEXT NOT NULL DEFAULT '[]', -- 审批时确认的权限快照
+    -- 有效期（UTC，格式 'YYYY-MM-DD HH:MM:SS'，半开区间 [valid_from, valid_until)）：
+    -- 两者均 NULL = 旧的永久授权（持续兼容）；valid_from 可单独设置（尚未生效）。
+    valid_from       TEXT,
+    valid_until      TEXT,
+    revoke_version   INTEGER NOT NULL DEFAULT 1, -- 撤销乐观锁版本号（CAS）
+    revoked_at       TEXT,
+    revoked_by       TEXT NOT NULL DEFAULT '',
+    revoke_reason    TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -119,6 +127,10 @@ CREATE TABLE IF NOT EXISTS requests (
     rollout_generation INTEGER,               -- 命中时的批次代次
     params_json      TEXT NOT NULL DEFAULT '',   -- 调用时推理配置快照
     params_fingerprint TEXT NOT NULL DEFAULT '', -- 推理配置指纹
+    -- 首个命中候选且候选工具扩大时，当场复核通过所依据的授权快照（approval_id/
+    -- 结论/覆盖工具/有效期/撤销状态/复查时刻）。之后复查只按本快照，不随后续
+    -- 到期或撤销改写结论；NULL = 该命中未走权限扩大复核（基线/未扩大候选/旧调用）。
+    authz_snapshot_json TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -304,11 +316,24 @@ _REQUESTS_NEW_COLUMNS = {
     "params_json": "ALTER TABLE requests ADD COLUMN params_json TEXT NOT NULL DEFAULT ''",
     "params_fingerprint":
         "ALTER TABLE requests ADD COLUMN params_fingerprint TEXT NOT NULL DEFAULT ''",
+    "authz_snapshot_json":
+        "ALTER TABLE requests ADD COLUMN authz_snapshot_json TEXT NOT NULL DEFAULT ''",
 }
 
 # 老库增量迁移：rollouts 的自动止损标记列
 _ROLLOUTS_NEW_COLUMNS = {
     "stoploss_tripped": "ALTER TABLE rollouts ADD COLUMN stoploss_tripped INTEGER NOT NULL DEFAULT 0",
+}
+
+# 老库增量迁移：approvals 的有效期与主动撤销列（旧行 NULL/默认值 = 永久授权）
+_APPROVALS_NEW_COLUMNS = {
+    "valid_from": "ALTER TABLE approvals ADD COLUMN valid_from TEXT",
+    "valid_until": "ALTER TABLE approvals ADD COLUMN valid_until TEXT",
+    "revoke_version":
+        "ALTER TABLE approvals ADD COLUMN revoke_version INTEGER NOT NULL DEFAULT 1",
+    "revoked_at": "ALTER TABLE approvals ADD COLUMN revoked_at TEXT",
+    "revoked_by": "ALTER TABLE approvals ADD COLUMN revoked_by TEXT NOT NULL DEFAULT ''",
+    "revoke_reason": "ALTER TABLE approvals ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''",
 }
 
 _lock = threading.Lock()
@@ -336,6 +361,10 @@ def init_db() -> None:
             rcols = {r["name"] for r in conn.execute("PRAGMA table_info(rollouts)")}
             for col, ddl in _ROLLOUTS_NEW_COLUMNS.items():
                 if col not in rcols:
+                    conn.execute(ddl)
+            acols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
+            for col, ddl in _APPROVALS_NEW_COLUMNS.items():
+                if col not in acols:
                     conn.execute(ddl)
             conn.commit()
         finally:

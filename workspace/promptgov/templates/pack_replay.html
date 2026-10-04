@@ -12,6 +12,34 @@
   产生时间 {{ req.created_at }}。
 </div>
 
+{% if authz %}
+<div class="card">
+  <h2>工具扩权授权快照（命中时固化，归档内复核）</h2>
+  {% if authz.required %}
+  <div class="kv">
+    <div>命中时状态</div><div><span class="badge b-{{ authz.state_at_check }}">
+      {{ authz.state_at_check }}</span> · 复核时刻
+      <span class="mono small">{{ authz.checked_at }}</span></div>
+    <div>授权记录</div><div class="mono small">{{ authz.approval_id }}
+      （{{ authz.approver }}，版本 v{{ authz.revoke_version }}）</div>
+    <div>有效期</div><div>{{ authz.window_text }}</div>
+    <div>新增工具</div><div>{% for t in authz.added_tools %}<span class="chip">{{ t }}</span>{% endfor %}</div>
+    <div>覆盖工具</div><div>{% for t in authz.granted_tools %}<span class="chip">{{ t }}</span>{% endfor %}</div>
+    <div>切点状态对照</div><div>
+      {% if authz.current_exists %}<span class="badge b-{{ authz.current_state }}">
+        {{ authz.current_state }}</span><span class="small mut">（按导出切点时刻）</span>
+        {% if authz.current_state != authz.state_at_check %}
+        <div class="small warn">切点时授权已变化（{{ authz.state_at_check }} →
+          {{ authz.current_state }}），但历史调用结论按命中时快照复查，不改写。</div>
+        {% endif %}
+      {% else %}<span class="mut">授权记录不在本包范围（边界外部引用）</span>{% endif %}</div>
+  </div>
+  {% else %}
+  <p class="small">该命中未走扩权复核（命中基线或候选未新增工具）。</p>
+  {% endif %}
+</div>
+{% endif %}
+
 {% if req.rollout_id %}
 <div class="card">
   <h2>生产推理效果回执（归档快照）

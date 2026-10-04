@@ -89,6 +89,14 @@ def run() -> None:
     services.run_evaluation(run3, actor)
     services.approve(v3["version_id"], "release", "ops-lead", "approved",
                      "发布审批通过（注意：权限扩大仍需专项审批）")
+    # v3 曾有一张 tool_expansion 专项授权，但已过期（演示有效期门禁：过期授权
+    # 不满足建批/命中/转正）；审批页可看到 expired 状态，重新审批即可恢复。
+    now = services.db_now()
+    services.approve(
+        v3["version_id"], "tool_expansion", "sec-oncall", "approved",
+        "退款工具扩权（限时灰度窗口，已过期）",
+        valid_from=services.shift_ts(now, -7 * 86400),
+        valid_until=services.shift_ts(now, -3600))
 
     # v4：能力较弱模型的草稿，评估可能不达标，演示模型差异/失败证据
     v4 = services.create_version(FAMILY, "1.3.0", INSTRUCTION_V2, CONTRACT_V2,

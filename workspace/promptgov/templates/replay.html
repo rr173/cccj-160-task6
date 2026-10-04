@@ -11,6 +11,39 @@
   · 代次 <span class="mono small">{{ req.rollout_generation }}</span>。{% endif %}
 </div>
 
+{% if authz.exists %}
+<div class="card">
+  <h2>工具扩权授权快照（命中时固化，历史结论只按此复查）</h2>
+  {% if authz.required %}
+  <div class="kv">
+    <div>命中时状态</div><div><span class="badge b-{{ authz.state_at_check }}">
+      {{ authz.state_at_check }}</span> · 复核时刻
+      <span class="mono small">{{ authz.checked_at }}</span></div>
+    <div>授权记录</div><div class="mono small">{{ authz.approval_id }}
+      （{{ authz.approver }}，版本 v{{ authz.revoke_version }}）</div>
+    <div>授权有效期</div><div>{{ authz.window_text }}
+      {% if authz.is_permanent %}<span class="chip">永久授权（旧审批兼容）</span>{% endif %}</div>
+    <div>新增工具</div><div>{% for t in authz.added_tools %}<span class="chip">{{ t }}</span>
+      {% endfor %}</div>
+    <div>授权覆盖工具</div><div>{% for t in authz.granted_tools %}<span class="chip">{{ t }}</span>
+      {% endfor %}</div>
+    <div>候选全部工具</div><div>{% for t in authz.candidate_tools %}<span class="chip">{{ t }}</span>
+      {% endfor %}</div>
+    <div>当前状态对照</div><div>
+      {% if not authz.current_exists %}<span class="mut">授权记录已不在库中</span>
+      {% else %}<span class="badge b-{{ authz.current_state }}">{{ authz.current_state }}</span>
+        {% if authz.current_remaining %} · 剩余 {{ authz.current_remaining }}{% endif %}
+        {% if authz.current_changed %}<div class="small warn">授权在本次调用之后发生了变化
+          （到期/撤销），但只影响新的建批/命中/转正，不改变本调用的复查结论。</div>
+        {% else %}<div class="small ok">自命中以来授权状态未变化。</div>{% endif %}
+      {% endif %}</div>
+  </div>
+  {% else %}
+  <p class="small">该命中未走扩权复核（命中基线或候选未新增工具），无需授权快照。</p>
+  {% endif %}
+</div>
+{% endif %}
+
 {% if req.rollout_id %}
 <div class="card">
   <h2>生产推理效果回执（自动止损）

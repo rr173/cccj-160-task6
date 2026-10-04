@@ -105,6 +105,17 @@
       </div>
       <div style="align-self:end"><button>建立批次</button></div>
     </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>候选</th><th>工具扩权门禁（按当前时刻复查）</th></tr></thead>
+      <tbody>
+      {% for c in candidates %}
+      <tr><td class="small mono">v{{ c.semver }} {{ c.version_id }}</td>
+        <td class="small">{% if c.gate.blocked %}<span class="bad">✗ {{ c.gate.text }}</span>
+          {% elif c.gate.expands %}<span class="ok">✓ {{ c.gate.text }}</span>
+          {% else %}<span class="mut">{{ c.gate.text }}</span>{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
   </form>
   {% else %}
   <p class="mut">暂无可放量的已审核候选构件（需非线上版本且持有通过的 release 审批）。</p>

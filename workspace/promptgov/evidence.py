@@ -149,7 +149,7 @@ AUDIT_ENTITY_TABLE = {
     "family": "families", "version": "versions", "eval_run": "eval_runs",
     "testset": "testsets", "request": "requests", "replay": "replays",
     "rollout": "rollouts", "stoploss_window": "stoploss_windows",
-    "stoploss_trigger": "stoploss_triggers",
+    "stoploss_trigger": "stoploss_triggers", "approval": "approvals",
     "evidence_pack": None,
 }
 
