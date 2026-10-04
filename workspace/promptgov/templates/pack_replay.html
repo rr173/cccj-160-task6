@@ -12,6 +12,30 @@
   产生时间 {{ req.created_at }}。
 </div>
 
+<div class="card">
+  <h2>工具扩权授权复查（归档时固化的授权快照）</h2>
+  {% if not auth.has_snapshot %}
+  <p class="small">旧调用无授权快照：按当时旧永久审批兼容，结论
+    <span class="badge b-active">LEGACY PASS</span>，不因随后到期/撤销改写。</p>
+  {% elif auth.is_not_needed %}
+  <p class="small">业务时刻 <span class="mono">{{ auth.checked_at }}</span>
+    候选未新增工具，无需 tool_expansion 授权：
+    <span class="badge b-active">NOT NEEDED</span>。</p>
+  {% else %}
+  <div class="kv">
+    <div>切点固化结论</div><div><span class="badge b-active">PASS</span>
+      <span class="small mut">按调用时快照，不随后续到期/撤销改写</span></div>
+    <div>业务请求时刻</div><div class="mono">{{ auth.checked_at }}</div>
+    <div>候选新增工具</div><div class="mono">{{ auth.added_tools }}</div>
+    <div>命中授权</div><div class="mono">{{ auth.approval_id }} · {{ auth.approver }}
+      · 版本号 v{{ auth.approval_version }}</div>
+    <div>有效期</div><div class="mono">{{ auth.valid_from or '立即' }} ~
+      {{ auth.valid_until or '永久' }}</div>
+    <div>覆盖工具</div><div class="mono">{{ auth.granted_tools }}</div>
+  </div>
+  {% endif %}
+</div>
+
 {% if req.rollout_id %}
 <div class="card">
   <h2>生产推理效果回执（归档快照）

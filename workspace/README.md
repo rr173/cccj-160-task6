@@ -15,6 +15,12 @@
 - 热更新 / 契约升级 / 评估迟到 / 并发回滚时，线上流量只看到**一个完整版本**；
   旧请求不受当前指针影响，永远可按原元数据复核。
 - **工具权限扩大必须重新审批**（独立的 `tool_expansion` 审批，区别于 `release`）。
+  tool_expansion 审批可设**生效/失效时刻**（UTC 闭区间，留空=旧的永久授权），
+  并支持以**版本号并发控制**的**主动撤销**。建批、候选首次命中、一步发布
+  （promote）与放量完成（complete）都在同一事务内按**业务请求发生时刻**重新
+  确认授权仍有效（已生效、未到期、未撤销、覆盖候选新增的**全部**工具），任一
+  校验失败都不改变线上指针或放量状态。旧永久审批继续兼容；已经产生的调用按
+  当时保存的**授权快照**复查，不因随后到期或撤销而改写结论。
 - **分批放量**：已审核构件可建立带权重的放量批次，调用方携带 `routing_key`，
   系统用稳定散列决定走当前构件还是候选构件；批次代次不变时同键路由不漂移。
   批次支持升档 / 冻结 / 恢复 / 完成 / 撤销，全部以 `expected_generation` 做 CAS。
@@ -35,8 +41,9 @@ python3 -m promptgov
 
 首启自动建表并灌入演示数据：模板族 `support-router`，线上 v1，候选
 v1.1.0（已建 20% 权重放量批次，并配置止损：1 小时窗口 / 最小样本 10 / 失败上限 30%，
-已入账 8 成功 2 失败，批次仍放量）、v1.2.0（扩大了 `refund.execute`，缺专项审批，
-建放量批次与发布都会被门禁拦下）、v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
+已入账 8 成功 2 失败，批次仍放量）、v1.2.0（扩大了 `refund.execute`，仅有一张
+**已到期**的 tool_expansion 审批，建放量批次与发布都会被门禁拦下；可重新审批）、
+v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
 
 ## 分批放量
 
@@ -58,6 +65,37 @@ v1.1.0（已建 20% 权重放量批次，并配置止损：1 小时窗口 / 最�
   （`UPDATE ... WHERE generation=? AND status IN (...)`，rowcount≠1 即 409），
   任何失败或冲突都回滚，不改变已生效路由表；原有一步切换接口
   （promote/rollback）继续工作。
+
+## 工具扩权审批：有效期与主动撤销
+
+- **审批行**（`approvals` 扩展列）：tool_expansion 审批带 `valid_from` / `valid_until`
+  （UTC 文本，与 `datetime('now')` 同格式可直接比较）。区间为**闭区间**：到达
+  `valid_from` 那一秒即生效，到达 `valid_until` 那一秒仍有效，越过它才失效
+  （"恰好到期"可精确断言）；两端留空 = 旧的**永久审批**，老库两列 NULL 天然兼容。
+  撤销不删除审批行，而是置 `revoked/revoked_at/revoked_by` 并把 `approval_version`
+  +1；授予/撤销分别追加一条 `approval_events`（审批历史，只追加不改写）。
+- **主动撤销（版本号 CAS）**：`POST /api/approvals/{id}/revoke {expected_version,reason}`。
+  `UPDATE ... WHERE revoked=0 AND approval_version=?`，rowcount≠1 即 409；重复撤销、
+  release 审批撤销都被拒绝。撤销后可重新提交一张新审批放行（旧撤销行与事件保留）。
+- **业务时刻重确认（任一失败即整体回滚，指针/放量状态不变）**：
+  1. **建批** `create_rollout`：授权在业务时刻须覆盖候选新增全部工具；
+  2. **候选首次命中**（invoke 路由到候选）：在同事务以 `datetime('now')` 为业务时刻
+     当场复核；该时刻同时固化为 `requests.created_at`，并在 `auth_snapshot_json` 保存
+     命中的审批 id/版本号/有效期/覆盖工具（基线命中与无扩权为 not_needed）；
+  3. **一步发布** `promote`：翻指针前同事务重确认；
+  4. **放量完成** `complete`：候选转正前同事务重确认（发布竞争：与撤销并发时，
+     撤销先提交则完成必败，指针与批次不变）。
+- **授权只覆盖部分工具不放行**：门禁按"候选新增工具 ⊆ 审批 granted_tools"判定，
+  只授予基线已有工具或漏掉某个新增工具都算未覆盖。
+- **旧调用复核不改写**：`GET /api/requests/{id}/auth-recheck` 与复查页只按调用当时
+  固化的 `auth_snapshot_json` 复查（`pass` / `not_needed`），并附该审批**当前**状态
+  （active/expired/revoked）仅供对照；随后到期或撤销都不改写当年放行结论。无快照的
+  旧调用恒为 `legacy_pass`。
+- **页面**：版本评估页（`/versions/{id}/eval`）审批面板支持选生效/失效时刻、覆盖工具，
+  展示每条审批的**有效状态徽章**（生效中/尚未生效/已到期/已撤销）、**剩余时间**或
+  永久、**版本号**、提前撤销表单，以及**审批历史**（授予/撤销事件）；调用复查页
+  （`/requests/{id}/replay`）新增"工具扩权授权复查"面板。证据包内同样可查
+  （`approval_events` 随包，窄包版本范围也带审批历史；调用授权快照随调用迁移）。
 
 ## 自动止损（生产推理效果回执）
 
@@ -194,13 +232,18 @@ v1.1.0（已建 20% 权重放量批次，并配置止损：1 小时窗口 / 最�
 | 恢复开窗重置 | 人工恢复 CAS 回 ramping、代次+1、旧窗 tripped 保留、新窗 seq+1 计数清零；历史请求仍可重演 |
 | 调用可复查 | `requests` 固化命中构件/推理配置/参数指纹/批次代次；复查不读当前批次状态 |
 | 权限扩大重新审批 | 相对线上基线新增工具即要求覆盖该工具集的 `tool_expansion` approved；回滚只收窄故免新审批 |
+| 审批有效期 | tool_expansion 带 valid_from/valid_until（UTC 闭区间，留空=永久）；旧审批两列 NULL 兼容 |
+| 审批主动撤销 | 撤销行保留、`approval_version+1`，`UPDATE...WHERE revoked=0 AND approval_version=?` CAS；release 不可撤销 |
+| 业务时刻重确认 | 建批/候选首次命中/promote/complete 均在写事务内按业务时刻复核授权存在/生效/未撤销/全覆盖 |
+| 授权快照复查 | 候选命中在 `requests.auth_snapshot_json` 固化命中审批 id/版本号/有效期；复查只读快照，到期/撤销不改写结论 |
 | 契约升级分级 | 删变量/加必填/改类型=breaking；仅加可选变量=compatible；网关按声明字段投影输入 |
 | 审计 | 所有生命周期动作写 `audit_log`（总览页可见） |
 
 发布门禁（单事务内全部满足才翻指针）：
 1. 存在 `passed` 评估证据，且证据模型 = 版本绑定模型、通过率 ≥ 门槛（默认 1.0）；
 2. 存在 approved 的 `release` 审批；
-3. 工具权限若扩大，存在覆盖全部工具的 approved `tool_expansion` 审批；
+3. 工具权限若扩大，业务请求发生时刻须存在**有效**（已生效/未到期/未撤销）且
+   覆盖候选新增全部工具的 approved `tool_expansion` 审批；
 4. CAS：当前线上指针 == 调用方提供的 `expected_active`。
 
 ## JSON API（摘要）
@@ -234,7 +277,12 @@ GET  /api/feedback/{feedback_id}             # 单条入账回执
 POST /api/versions/{vid}/eval/start
 POST /api/eval-runs/{rid}/run
 GET  /api/versions/{vid}/eval-runs
-POST /api/versions/{vid}/approve             # {kind: release|tool_expansion, decision, ...}
+POST /api/versions/{vid}/approve             # {kind: release|tool_expansion, decision, valid_from?, valid_until?, granted_tools?, ...}
+GET  /api/approvals[?version=]               # 审批列表（含 state/剩余时间）
+GET  /api/approvals/{aid}                    # 单条审批（state/remaining_seconds/版本号）
+POST /api/approvals/{aid}/revoke             # {expected_version, reason} 主动撤销（CAS）
+GET  /api/approvals/{aid}/events             # 授予/撤销事件历史
+GET  /api/requests/{rid}/auth-recheck        # 按调用时授权快照复查（pass/not_needed/legacy_pass）
 GET  /api/eval-runs/{rid}
 GET  /api/requests[?family=]
 GET  /api/requests/{rid}
@@ -263,7 +311,9 @@ POST /api/evidence/imports/{iid}/abort
 
 ## 代码地图
 
-- `db.py`：SQLite schema（含 `rollouts` 批次表、`requests` 放量证据列，
+- `db.py`：SQLite schema（含 `rollouts` 批次表、`requests` 放量证据列与
+  `auth_snapshot_json` 授权快照列，approvals 的有效期/撤销版本号列与
+  `approval_events` 审批事件表，
   `stoploss_configs/windows/triggers/feedback_receipts` 止损四表，以及证据包
   `evidence_packs/evidence_imports/evidence_audit` 归档表与 `app_meta` 实例元数据）、
   WAL、`write_tx()` 立即写锁事务、`snapshot_tx()` 稳定切点只读快照事务、审计、
@@ -283,6 +333,11 @@ POST /api/evidence/imports/{iid}/abort
 - `seed.py`：幂等演示数据。
 - `tests/test_rollout.py`：放量机制端到端验证（同键稳定/按比例分流/并发升档/
   冻结/撤销/复查复现/专项授权/HTTP 冒烟），`python3 -m unittest discover -s tests`。
+- `tests/test_approvals.py`：审批有效期与主动撤销端到端验证——有效期闭区间边界
+  （尚未生效/恰好到期/已到期）、建批/候选首次命中/promote/complete 三+一路径按业务
+  时刻重确认、授权只覆盖部分工具被拒、撤销 CAS 与发布竞争、撤销后重新审批、旧永久
+  审批兼容、已产生调用按授权快照复查（随后到期/撤销不改写）、失败不改指针/放量状态、
+  JSON API 与页面冒烟。
 - `tests/test_stoploss.py`：自动止损端到端验证——重复回执、阈值临界（等上限不触发/
   样本不足不触发/严格越界触发）、20 路并发越界只触发一次、迟到回执、旧代次只审计、
   无关/基线请求拒绝、人工恢复开窗重置与旧窗口复核、批次终结关窗、JSON API 与页面冒烟。

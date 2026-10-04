@@ -653,6 +653,88 @@ class ImportFlowTest(unittest.TestCase):
                 evidence.put_import_shard(iid, 999, b"x")  # 序号越界
 
 
+# ================================================================ 审批有效期/撤销随包
+
+class ApprovalInPackTest(unittest.TestCase):
+    """tool_expansion 的有效期、撤销事件与调用授权快照随证据包迁移，
+    导入空实例后包内仍可复查当年授权结论。"""
+
+    def _family_with_expansion_call(self, *, revoke: bool):
+        from promptgov import core
+        fid = f"f-{_u()}"
+        services.create_family(fid, f"族{fid}", "", "test")
+        services.create_testset(fid, "固定测试集", TEST_CASES, "test")
+        v1 = services.create_version(fid, "1.0.0", INSTRUCTION_V1, CONTRACT,
+                                     ["ticket.read"], PARAMS, "langfang-3-64k", "test")
+        services.run_evaluation(services.start_evaluation(v1["version_id"], "test"), "test")
+        services.approve(v1["version_id"], "release", "ops", "approved", "首发")
+        services.promote(fid, v1["version_id"], "test")
+        v2 = services.create_version(fid, "1.1.0", INSTRUCTION_V2, CONTRACT,
+                                     ["ticket.read", "refund.execute"], PARAMS,
+                                     "langfang-3-64k", "test")
+        services.run_evaluation(services.start_evaluation(v2["version_id"], "test"), "test")
+        services.approve(v2["version_id"], "release", "ops", "approved", "候选")
+        from datetime import datetime, timedelta, timezone
+        end = (datetime.now(timezone.utc).replace(tzinfo=None)
+               + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        a = services.approve(v2["version_id"], "tool_expansion", "sec", "approved",
+                             "窗口扩权", valid_until=end)
+        ro = services.create_rollout(fid, v2["version_id"], 100, "test")
+        i = 0
+        key = None
+        while key is None:
+            k = f"u-{_u()}-{i}"
+            if core.stable_bucket(ro["rollout_id"], k) < 100:
+                key = k
+            i += 1
+        res = services.invoke(fid, INPUTS, "test",
+                              request_id=f"req-{_u()}", routing_key=key)
+        self.assertEqual(res["version_id"], v2["version_id"])
+        if revoke:
+            services.revoke_approval(a["approval_id"], 1, "sec", "事后撤销")
+        return fid, v1["version_id"], v2["version_id"], res["request_id"], a["approval_id"]
+
+    def test_family_pack_contains_windows_events_and_snapshot(self):
+        fid, v1, v2, rid, aid = self._family_with_expansion_call(revoke=True)
+        pack = evidence.build_pack({"kind": "family", "family_id": fid}, "test")
+        view = evidence.PackView(pack["pack_id"])
+        # 审批行带有效期/撤销标记
+        a = view._get("approvals", aid)
+        self.assertIsNotNone(a)
+        self.assertTrue(a["valid_until"])
+        self.assertEqual(int(a["revoked"]), 1)
+        # 授予 + 撤销两个事件随包
+        events = view.approval_events(v2)
+        self.assertEqual(sorted(e["kind"] for e in events), ["grant", "revoke"])
+        # 调用授权快照随包且结论可复查
+        snap = view.request_auth_snapshot(rid)
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["result"], "covered")
+        self.assertEqual(snap["approval_id"], aid)
+        self.assertEqual(snap["added_tools"], ["refund.execute"])
+
+    def test_version_pack_roundtrip_keeps_approval_history(self):
+        fid, v1, v2, rid, aid = self._family_with_expansion_call(revoke=True)
+        pack = evidence.build_pack({"kind": "version", "version_id": v2}, "test",
+                                   shard_size_bytes=4096)
+        blob = evidence.pack_file_bytes(pack["pack_id"])[1]
+        env_line, shards, _ = split_pack(blob)
+        path = fresh_target_db()
+        iid = upload_all(path, env_line, shards)
+        res = commit_on(path, iid)
+        with evidence.bind_db(path, init_schema=False):
+            view = evidence.PackView(res["pack_id"])
+            events = view.approval_events(v2)
+            self.assertEqual(sorted(e["kind"] for e in events), ["grant", "revoke"])
+            a = view._get("approvals", aid)
+            self.assertEqual(int(a["revoked"]), 1)
+            snap = view.request_auth_snapshot(rid)
+            self.assertIsNotNone(snap, "授权快照必须随窄包迁移")
+            self.assertEqual(snap["approval_version"], 1, "快照停留在调用当时版本号")
+            self.verify = evidence.verify_bytes(blob)
+            self.assertTrue(self.verify["ok"])
+
+
 # ================================================================ HTTP 冒烟
 
 class HttpSmokeTest(unittest.TestCase):

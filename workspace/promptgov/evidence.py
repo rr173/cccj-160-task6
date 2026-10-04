@@ -99,7 +99,7 @@ DEFAULT_SHARD_BYTES = 1024 * 1024  # 数据分片默认 1 MiB
 
 # 证据闭包覆盖的全部表（计数与展示顺序）
 TABLES = (
-    "families", "versions", "approvals", "testsets", "testcases",
+    "families", "versions", "approvals", "approval_events", "testsets", "testcases",
     "eval_runs", "eval_cases", "requests", "rollouts",
     "stoploss_configs", "stoploss_windows", "stoploss_triggers",
     "feedback_receipts", "replays", "audit_log",
@@ -107,6 +107,7 @@ TABLES = (
 # 各表主键列
 PK = {
     "families": "family_id", "versions": "version_id", "approvals": "approval_id",
+    "approval_events": "event_id",
     "testsets": "testset_id", "testcases": "case_id", "eval_runs": "run_id",
     "eval_cases": "id", "requests": "request_id", "rollouts": "rollout_id",
     "stoploss_configs": "rollout_id", "stoploss_windows": "window_id",
@@ -121,6 +122,7 @@ REF_FIELDS: dict[str, list[tuple[str, str]]] = {
     "families": [("active_version_id", "versions")],
     "versions": [("family_id", "families")],
     "approvals": [("version_id", "versions")],
+    "approval_events": [("approval_id", "approvals"), ("version_id", "versions")],
     "testsets": [("family_id", "families")],
     "testcases": [("testset_id", "testsets")],
     "eval_runs": [("version_id", "versions"), ("testset_id", "testsets")],
@@ -149,7 +151,7 @@ AUDIT_ENTITY_TABLE = {
     "family": "families", "version": "versions", "eval_run": "eval_runs",
     "testset": "testsets", "request": "requests", "replay": "replays",
     "rollout": "rollouts", "stoploss_window": "stoploss_windows",
-    "stoploss_trigger": "stoploss_triggers",
+    "stoploss_trigger": "stoploss_triggers", "approval": "approvals",
     "evidence_pack": None,
 }
 
@@ -220,7 +222,17 @@ def _summary(table: str, row: dict, semvers: dict[str, str]) -> str:
         model = json.loads(row["model_params"]).get("_bound_model", "?")
         return f"{row['semver']} [{row['status']}] model={model} hash={row['content_hash'][:10]}"
     if table == "approvals":
-        return f"{row['kind']}/{row['decision']} by {row['approver']}"
+        tail = ""
+        if row.get("kind") == "tool_expansion":
+            if int(row.get("revoked") or 0):
+                tail = "（已撤销）"
+            elif row.get("valid_from") or row.get("valid_until"):
+                tail = f"（{row.get('valid_from') or '立即'}~{row.get('valid_until') or '永久'}）"
+            else:
+                tail = "（永久）"
+        return f"{row['kind']}/{row['decision']} by {row['approver']}{tail}"
+    if table == "approval_events":
+        return f"{row['kind']} approval={str(row['approval_id'])[:12]} v{row['approval_version']}"
     if table == "testsets":
         return row["name"]
     if table == "testcases":
@@ -268,8 +280,9 @@ CHILDREN: dict[str, list[tuple[str, str]]] = {
     "families": [("versions", "family_id"), ("testsets", "family_id"),
                  ("requests", "family_id"), ("rollouts", "family_id")],
     "testsets": [("testcases", "testset_id")],
-    "versions": [("approvals", "version_id"), ("eval_runs", "version_id"),
-                 ("requests", "version_id")],
+    "versions": [("approvals", "version_id"), ("approval_events", "version_id"),
+                 ("eval_runs", "version_id"), ("requests", "version_id")],
+    "approvals": [("approval_events", "approval_id")],
     "eval_runs": [("eval_cases", "run_id")],
     "requests": [("replays", "request_id")],
     "rollouts": [("stoploss_configs", "rollout_id"),
@@ -386,6 +399,8 @@ def _collect_version_scope(c, chosen: dict[str, set[str]], vid: str) -> None:
     family_ids = {str(row["family_id"])}
     chosen["families"] |= family_ids
     chosen["approvals"] |= _fetch_ids(c, "approvals", "version_id", {vid})
+    # 审批生命周期事件（授予/撤销）随该版本审批入包，构成完整审批历史
+    chosen["approval_events"] |= _fetch_ids(c, "approval_events", "version_id", {vid})
     run_ids = _fetch_ids(c, "eval_runs", "version_id", {vid})
     chosen["eval_runs"] |= run_ids
     # 评估证据依赖的固定测试集（共享测试集：随评估整组带其用例）
@@ -845,6 +860,18 @@ def verify_bytes(file_bytes: bytes) -> dict:
         if not rec_of("testcases", ec.get("case_id")):
             _err(errors, "eval_case_testcase_missing",
                  f"评估用例 {case_id} 缺少固定测试集用例对象")
+    for ev_id, ev in ((k[1], r) for k, r in by_key.items()
+                      if k[0] == "approval_events"):
+        a = rec_of("approvals", ev.get("approval_id"))
+        if not a:
+            _err(errors, "approval_event_approval_missing",
+                 f"审批事件 {ev_id} 缺少审批对象")
+        elif str(a.get("version_id")) != str(ev.get("version_id")):
+            _err(errors, "approval_event_version_mismatch",
+                 f"审批事件 {ev_id} 的版本与审批所属版本不一致")
+        elif ev.get("kind") == "revoke" and not int(a.get("revoked") or 0):
+            _err(errors, "approval_event_revoke_dangling",
+                 f"审批事件 {ev_id} 声称撤销，但审批行未标记 revoked")
     for ro_id, ro in ((k[1], r) for k, r in by_key.items() if k[0] == "rollouts"):
         for fld in ("candidate_version_id", "base_version_id"):
             if not rec_of("versions", ro.get(fld)):
@@ -1267,6 +1294,20 @@ class PackView:
 
     def approvals(self, version_id: str) -> list[dict]:
         return [r for r in self.by_table["approvals"] if r["version_id"] == version_id]
+
+    def approval_events(self, version_id: str) -> list[dict]:
+        return sorted((r for r in self.by_table["approval_events"]
+                       if r["version_id"] == version_id),
+                      key=lambda r: str(r.get("created_at")), reverse=True)
+
+    def request_auth_snapshot(self, request_id: str) -> dict | None:
+        req = self.request(request_id)
+        if not req or not req.get("auth_snapshot_json"):
+            return None
+        try:
+            return json.loads(req["auth_snapshot_json"])
+        except Exception:  # noqa: BLE001
+            return None
 
     def requests(self, family_id: str | None = None, limit: int = 200) -> list[dict]:
         rows = self.by_table["requests"]

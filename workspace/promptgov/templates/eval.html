@@ -68,17 +68,74 @@
         <option value="rejected">rejected</option></select>
       <label>审批人</label><input name="approver" placeholder="security / ops-lead">
       <label>理由</label><input name="reason" placeholder="例如：新增 refund.execute 已复核风险">
+      <div class="note" style="margin:10px 0">
+        <b>tool_expansion 有效期</b>（release 审批不设有效期，留空即旧的永久授权）：
+        <div class="grid g2" style="margin-top:8px">
+          <div><label>生效时刻（UTC，留空=立即）</label>
+            <input name="valid_from" type="datetime-local" step="1"></div>
+          <div><label>失效时刻（UTC，留空=永久；失效那一秒仍有效）</label>
+            <input name="valid_until" type="datetime-local" step="1"></div>
+        </div>
+        <label style="margin-top:8px">覆盖工具（逗号分隔，留空=覆盖该版本全部工具；
+          门禁要求覆盖候选新增的<b>全部</b>工具）</label>
+        <input name="granted_tools" placeholder="refund.execute, ticket.read">
+      </div>
       <div class="row" style="margin-top:10px"><button>提交审批</button></div>
     </form>
-    <h3>审批记录</h3>
+    <h3>审批记录与有效状态</h3>
     <table>
+      <thead><tr><th>类型</th><th>结论/状态</th><th>审批人</th><th>覆盖工具与有效期</th>
+        <th>版本</th><th>撤销</th></tr></thead>
       <tbody>
       {% for a in approvals %}
-        <tr><td><span class="chip">{{ a.kind }}</span></td>
+        <tr>
+          <td><span class="chip">{{ a.kind }}</span><div class="small">{{ a.created_at }}</div></td>
           <td>{% if a.decision == 'approved' %}<span class="ok">{{ a.decision }}</span>
-            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}</td>
-          <td class="small">{{ a.approver }}</td><td class="small mut">{{ a.reason }}</td></tr>
+            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}
+            {% if a.decision == 'approved' %}
+              {% if a.state == 'active' %}<div class="badge b-active">生效中</div>
+              <div class="small ok">{{ a.state_text }}</div>
+              {% elif a.state == 'not_yet' %}<div class="badge b-evaluating">尚未生效</div>
+              <div class="small warn">{{ a.state_text }}</div>
+              {% elif a.state == 'expired' %}<div class="badge b-failed_eval">已到期</div>
+              {% elif a.state == 'revoked' %}<div class="badge b-failed_eval">已撤销</div>
+              <div class="small mut">{{ a.revoked_at }} · {{ a.revoked_by }} · {{ a.revoke_reason }}</div>
+              {% endif %}
+            {% endif %}</td>
+          <td class="small">{{ a.approver }}<div class="small mut">{{ a.reason }}</div></td>
+          <td class="small">
+            {% if a.is_expansion %}<div class="mono">{{ a.granted_tools }}</div>
+            <div class="small mut">{{ a.window_text }}</div>
+            {% else %}<span class="mut">—（release 不设有效期）</span>{% endif %}</td>
+          <td class="small mono">v{{ a.approval_version }}</td>
+          <td>{% if a.can_revoke %}
+            <form method="post" action="/ui/approvals/{{ a.approval_id }}/revoke"
+                  onsubmit="return confirm('确认提前撤销该授权？撤销后建批/候选命中/一步发布都会被门禁拦下；历史调用结论不变。')">
+              <input type="hidden" name="expected_version" value="{{ a.approval_version }}">
+              <input name="reason" placeholder="撤销原因（必填）" required
+                     style="margin-bottom:6px;min-width:160px">
+              <button class="danger" style="padding:4px 10px">提前撤销</button>
+            </form>
+            {% else %}<span class="small mut">—</span>{% endif %}</td>
+        </tr>
       {% endfor %}
+      </tbody>
+    </table>
+    <h3>审批历史（授予 / 撤销事件）</h3>
+    <table>
+      <thead><tr><th>时间</th><th>事件</th><th>操作人</th><th>审批</th><th>有效期</th><th>版本</th><th>明细</th></tr></thead>
+      <tbody>
+      {% for e in approval_events %}
+        <tr><td class="small">{{ e.created_at }}</td>
+          <td>{% if e.kind == 'grant' %}<span class="badge b-approved">授予</span>
+            {% else %}<span class="badge b-failed_eval">撤销</span>{% endif %}</td>
+          <td class="small">{{ e.actor }}</td>
+          <td class="small mono">{{ e.approval_id }}</td>
+          <td class="small mut">{{ e.window_text }}</td>
+          <td class="small mono">v{{ e.approval_version }}</td>
+          <td class="small">{{ e.detail }}</td></tr>
+      {% endfor %}
+      {% if not approval_events %}<tr><td colspan="7" class="small mut">暂无 tool_expansion 审批事件。</td></tr>{% endif %}
       </tbody>
     </table>
   </div>

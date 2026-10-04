@@ -89,6 +89,11 @@ def run() -> None:
     services.run_evaluation(run3, actor)
     services.approve(v3["version_id"], "release", "ops-lead", "approved",
                      "发布审批通过（注意：权限扩大仍需专项审批）")
+    # 一张曾经授予、现已到期的 tool_expansion 审批：演示有效期门禁与页面状态
+    # （到期后建批/发布/候选命中都会被门禁拦下；可重新审批）
+    services.approve(v3["version_id"], "tool_expansion", "sec", "approved",
+                     "临时扩权窗口（演示：已到期，门禁不放行）",
+                     valid_from="2026-01-01 00:00", valid_until="2026-01-02 00:00")
 
     # v4：能力较弱模型的草稿，评估可能不达标，演示模型差异/失败证据
     v4 = services.create_version(FAMILY, "1.3.0", INSTRUCTION_V2, CONTRACT_V2,

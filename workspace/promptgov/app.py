@@ -108,6 +108,44 @@ def _short(h: str, n=12) -> str:
     return (h or "")[:n]
 
 
+def _fmt_seconds(sec: int) -> str:
+    sec = max(int(sec), 0)
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}天")
+    if h:
+        parts.append(f"{h}小时")
+    if m and not d:
+        parts.append(f"{m}分")
+    if not d and not h and m < 2:
+        parts.append(f"{s}秒")
+    return "".join(parts) or "0秒"
+
+
+def _window_text(vf, vu) -> str:
+    if not vf and not vu:
+        return "永久有效（旧审批兼容）"
+    return f"{vf or '立即'} ~ {vu or '永久'}"
+
+
+def _pack_approval_state(a: dict, at: str | None = None) -> str:
+    """归档审批行在切点 at（默认行自身时刻，即"归档当时"）的状态。"""
+    if a.get("decision") != "approved":
+        return "rejected"
+    if int(a.get("revoked") or 0):
+        return "revoked"
+    vf, vu = a.get("valid_from"), a.get("valid_until")
+    if not vf and not vu:
+        return "active"
+    # 归档展示以失效时刻为准：包内只反映切点事实
+    if vu:
+        return "expired" if (at is None or at > vu) else "active"
+    return "active"
+
+
 def _ver_context(v: dict) -> dict:
     return {
         "version_id": v["version_id"], "semver": v["semver"], "status": v["status"],
@@ -282,6 +320,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._ui_eval_run(p.split("/")[3])
         if method == "POST" and re.fullmatch(r"/ui/versions/[\w.-]+/approve", p):
             return self._ui_approve(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/approvals/[\w.-]+/revoke", p):
+            return self._ui_revoke_approval(p.split("/")[3])
         if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/(promote|rollback)", p):
             fid = p.split("/")[3]
             return self._ui_promote_rollback(fid, p.split("/")[-1])
@@ -386,9 +426,27 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/versions/([\w.-]+)/approve", p)
         if method == "POST" and m:
             b = _json_body(self)
-            return self._json(services.approve(m.group(1), b["kind"], b.get("approver", "api"),
-                                               b.get("decision", "approved"),
-                                               b.get("reason", "")), 201)
+            return self._json(services.approve(
+                m.group(1), b["kind"], b.get("approver", "api"),
+                b.get("decision", "approved"), b.get("reason", ""),
+                b.get("valid_from"), b.get("valid_until"),
+                b.get("granted_tools")), 201)
+        m = re.fullmatch(r"/api/approvals/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_approval(m.group(1)))
+        m = re.fullmatch(r"/api/approvals/([\w.-]+)/revoke", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            if b.get("expected_version") is None:
+                raise services.DomainError("撤销必须提供 expected_version 做并发控制")
+            return self._json(services.revoke_approval(
+                m.group(1), int(b["expected_version"]), b.get("actor", "api"),
+                b.get("reason", "")))
+        m = re.fullmatch(r"/api/approvals/([\w.-]+)/events", p)
+        if method == "GET" and m:
+            return self._json(services.list_approval_events(approval_id=m.group(1)))
+        if method == "GET" and p == "/api/approvals":
+            return self._json(services.list_approvals(q.get("version", [None])[0]))
         m = re.fullmatch(r"/api/eval-runs/([\w.-]+)", p)
         if method == "GET" and m:
             return self._json(services.get_eval_run(m.group(1)))
@@ -469,6 +527,9 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/requests/([\w.-]+)", p)
         if method == "GET" and m:
             return self._json(services.get_request(m.group(1)))
+        m = re.fullmatch(r"/api/requests/([\w.-]+)/auth-recheck", p)
+        if method == "GET" and m:
+            return self._json(services.recheck_request_auth(m.group(1)))
         m = re.fullmatch(r"/api/requests/([\w.-]+)/replays", p)
         if method == "GET" and m:
             return self._json(services.list_replays(m.group(1)))
@@ -678,12 +739,56 @@ class Handler(BaseHTTPRequestHandler):
             cur_run = detail
         else:
             cur_run = None
-        approvals = services.list_approvals(vid)
+        approvals = [self._approval_card(a) for a in services.list_approvals(vid)]
+        approval_events = [{
+            "event_id": e["event_id"], "kind": e["kind"], "actor": e["actor"],
+            "approval_id": e["approval_id"], "created_at": e["created_at"],
+            "detail": e["detail"], "approval_version": e["approval_version"],
+            "window_text": _window_text(e.get("valid_from"), e.get("valid_until")),
+        } for e in services.list_approval_events(version_id=vid)]
         vc = _ver_context(v)
         ctx = {"v": vc, "family": family, "runs": run_rows, "cases": cases,
                "cur_run": cur_run, "approvals": approvals,
+               "approval_events": approval_events,
                "threshold": config.PASS_THRESHOLD, "flash": self._flash(q)}
         self._html(page(f"评估 · {v['semver']}", "eval.html", ctx))
+
+    @staticmethod
+    def _approval_card(a: dict) -> dict:
+        """审批行的页面视图：有效状态徽章、有效期、剩余时间、可撤销标志。"""
+        state = a.get("state", "active")
+        remaining = a.get("remaining_seconds")
+        if state == "active":
+            if remaining is None:
+                remain_text = "永久有效"
+            else:
+                remain_text = f"剩余 {_fmt_seconds(int(remaining))}"
+        elif state == "not_yet":
+            remain_text = f"未生效（{_fmt_seconds(-int(remaining))} 后生效）"
+        elif state == "expired":
+            remain_text = "已到期"
+        elif state == "revoked":
+            remain_text = "已主动撤销"
+        else:
+            remain_text = state
+        is_expansion = a["kind"] == "tool_expansion"
+        tools = a.get("granted_tools")
+        if not isinstance(tools, list):
+            tools = json.loads(a["granted_tools"])
+        return {
+            "approval_id": a["approval_id"], "kind": a["kind"],
+            "decision": a["decision"], "approver": a["approver"],
+            "reason": a.get("reason", ""), "created_at": a["created_at"],
+            "state": state, "state_text": remain_text,
+            "is_expansion": is_expansion, "granted_tools": tools,
+            "valid_from": a.get("valid_from") or "", "valid_until": a.get("valid_until") or "",
+            "window_text": _window_text(a.get("valid_from"), a.get("valid_until")),
+            "approval_version": a.get("approval_version", 1),
+            "can_revoke": is_expansion and state == "active",
+            "revoked_by": a.get("revoked_by") or "",
+            "revoked_at": a.get("revoked_at") or "",
+            "revoke_reason": a.get("revoke_reason") or "",
+        }
 
     def _page_rollout(self, fid, q):
         self._is_page = True
@@ -807,6 +912,27 @@ class Handler(BaseHTTPRequestHandler):
             except services.NotFound:
                 rollout = None
         receipt = services.get_request_receipt(rid)
+        # 工具扩权授权快照复查（按调用当时固化的快照，不随后续到期/撤销改写）
+        auth_rc = services.recheck_request_auth(rid)
+        snap = auth_rc.get("snapshot") or {}
+        cur = auth_rc.get("current") or {}
+        auth_card = {
+            "has_snapshot": bool(auth_rc.get("snapshot")),
+            "conclusion": auth_rc["conclusion"],
+            "is_legacy": auth_rc["conclusion"] == "legacy_pass",
+            "is_pass": auth_rc["conclusion"] in ("pass", "not_needed", "legacy_pass"),
+            "checked_at": snap.get("checked_at", ""),
+            "added_tools": snap.get("added_tools", []),
+            "approval_id": snap.get("approval_id", ""),
+            "approval_version_at_call": snap.get("approval_version", ""),
+            "valid_from": snap.get("valid_from", ""),
+            "valid_until": snap.get("valid_until", ""),
+            "granted_tools": snap.get("granted_tools", []),
+            "candidate_tools": snap.get("candidate_tools", []),
+            "approver": snap.get("approver", ""),
+            "current_state": cur.get("state", ""),
+            "current_version": cur.get("approval_version_now", ""),
+        }
         is_candidate_hit = bool(
             rollout and req["version_id"] == rollout["candidate_version_id"])
         same_generation = bool(
@@ -849,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
                        "created_at": req["created_at"]},
                "rollout": rollout,
                "feedback": feedback_card,
+               "auth": auth_card,
                "versions": versions, "models": llm.list_models(),
                "replays": rpl_rows, "result": None, "flash": self._flash(q)}
         # 若带 ?rpl= 则展示该报告详情
@@ -969,7 +1096,16 @@ class Handler(BaseHTTPRequestHandler):
                      "selected": r["run_id"] == selected_id} for r in runs]
         ctx = {"pid": pid, "v": vc, "family": family, "runs": run_rows,
                "cur_run": cur, "cases": cases, "threshold": config.PASS_THRESHOLD,
-               "approvals": view.approvals(vid), "flash": self._flash(q)}
+               "approvals": [self._approval_card(
+                   {**a, "state": _pack_approval_state(a, meta.get("exported_at"))})
+                   for a in view.approvals(vid)],
+               "approval_events": [{
+                   "event_id": e["event_id"], "kind": e["kind"], "actor": e["actor"],
+                   "approval_id": e["approval_id"], "created_at": e["created_at"],
+                   "detail": e["detail"], "approval_version": e["approval_version"],
+                   "window_text": _window_text(e.get("valid_from"), e.get("valid_until")),
+               } for e in view.approval_events(vid)],
+               "flash": self._flash(q)}
         self._html(page(f"包内评估 · {vc['semver']}", "pack_eval.html", ctx))
 
     def _page_pack_replay(self, pid, rid, q):
@@ -981,6 +1117,22 @@ class Handler(BaseHTTPRequestHandler):
         family = view._get("families", req["family_id"])
         rollout = view.rollout(req["rollout_id"]) if req.get("rollout_id") else None
         receipt = view.receipt(rid)
+        auth_snap = view.request_auth_snapshot(rid)
+        if auth_snap:
+            auth_card = {
+                "has_snapshot": True,
+                "is_not_needed": auth_snap.get("result") == "not_needed",
+                "checked_at": auth_snap.get("checked_at", ""),
+                "added_tools": auth_snap.get("added_tools", []),
+                "approval_id": auth_snap.get("approval_id", ""),
+                "approval_version": auth_snap.get("approval_version", ""),
+                "valid_from": auth_snap.get("valid_from", ""),
+                "valid_until": auth_snap.get("valid_until", ""),
+                "granted_tools": auth_snap.get("granted_tools", []),
+                "approver": auth_snap.get("approver", ""),
+            }
+        else:
+            auth_card = {"has_snapshot": False}
         semvers = {x["version_id"]: x["semver"] for x in view.by_table["versions"]}
         rpl_rows = [{"replay_id": r["replay_id"], "mode": r["mode"], "verdict": r["verdict"],
                      "changed_axis": r["changed_axis"], "same_template": r["same_template"],
@@ -1008,6 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
                     if req.get("params_json") else "",
                     "created_at": req["created_at"]},
             "has_receipt": bool(receipt), "receipt": receipt,
+            "auth": auth_card,
             "replays": rpl_rows, "flash": self._flash(q)}
         self._html(page("包内调用复查", "pack_replay.html", ctx))
 
@@ -1097,9 +1250,28 @@ class Handler(BaseHTTPRequestHandler):
     def _ui_approve(self, vid):
         self._is_page = True
         f = _form(self)
-        services.approve(vid, f["kind"], f.get("approver", "web") or "web",
-                         f.get("decision", "approved"), f.get("reason", ""))
+        kind = f["kind"]
+        vf = vu = None
+        granted = None
+        if kind == "tool_expansion":
+            # datetime-local 提交 "YYYY-MM-DDTHH:MM"（可能带秒）；留空=不设限
+            vf = f.get("valid_from", "").strip() or None
+            vu = f.get("valid_until", "").strip() or None
+            raw_tools = f.get("granted_tools", "").strip()
+            if raw_tools:
+                granted = [t.strip() for t in raw_tools.split(",") if t.strip()]
+        services.approve(vid, kind, f.get("approver", "web") or "web",
+                         f.get("decision", "approved"), f.get("reason", ""),
+                         vf, vu, granted)
         self._redirect(f"/versions/{vid}/eval")
+
+    def _ui_revoke_approval(self, aid):
+        self._is_page = True
+        f = _form(self)
+        a = services.revoke_approval(
+            aid, int(f["expected_version"]), f.get("actor", "web") or "web",
+            f.get("reason", ""))
+        self._redirect(f"/versions/{a['version_id']}/eval")
 
     def _ui_promote_rollback(self, fid, action):
         self._is_page = True

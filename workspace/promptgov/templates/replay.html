@@ -11,6 +11,40 @@
   · 代次 <span class="mono small">{{ req.rollout_generation }}</span>。{% endif %}
 </div>
 
+<div class="card">
+  <h2>工具扩权授权复查（按调用时快照，不随后续到期/撤销改写）</h2>
+  {% if not auth.has_snapshot %}
+  <p class="small">本调用为<b>旧调用</b>（无授权快照，多为基线命中或旧版本产生）：
+    按当时旧永久审批兼容复查，结论 <span class="badge b-active">LEGACY PASS</span>，
+    不因审批随后到期或被撤销而改变。</p>
+  {% elif auth.conclusion == 'not_needed' %}
+  <p class="small">业务时刻 <span class="mono">{{ auth.checked_at }}</span>
+    命中候选构件，但其工具集合相对基线没有新增，无需 tool_expansion 专项授权：
+    <span class="badge b-active">NOT NEEDED</span>。</p>
+  {% else %}
+  <div class="kv">
+    <div>复查结论</div><div><span class="badge b-active">PASS</span>
+      <span class="small ok">调用当年授权有效，结论不因审批现状改写</span></div>
+    <div>业务请求时刻</div><div class="mono">{{ auth.checked_at }}</div>
+    <div>候选新增工具</div><div class="mono">{{ auth.added_tools }}</div>
+    <div>命中的授权</div><div class="mono">{{ auth.approval_id }} · 审批人 {{ auth.approver }}
+      · 版本号 v{{ auth.approval_version_at_call }}</div>
+    <div>授权有效期</div><div>{% if auth.valid_from or auth.valid_until %}
+      <span class="mono">{{ auth.valid_from or '立即' }} ~ {{ auth.valid_until or '永久' }}</span>
+      （闭区间，失效那一秒仍有效）{% else %}<span class="mut">永久授权</span>{% endif %}</div>
+    <div>覆盖工具</div><div class="mono">{{ auth.granted_tools }}</div>
+    <div>该审批当前状态</div><div>
+      {% if auth.current_state == 'active' %}<span class="badge b-active">仍生效中</span>
+      {% elif auth.current_state == 'expired' %}<span class="badge b-failed_eval">现已到期</span>
+      <span class="small mut">（不影响当年放行结论）</span>
+      {% elif auth.current_state == 'revoked' %}<span class="badge b-failed_eval">现已撤销</span>
+      <span class="small mut">（不影响当年放行结论）</span>
+      {% else %}<span class="chip">{{ auth.current_state }}</span>{% endif %}
+      <span class="small mut">当前版本号 v{{ auth.current_version }}</span></div>
+  </div>
+  {% endif %}
+</div>
+
 {% if req.rollout_id %}
 <div class="card">
   <h2>生产推理效果回执（自动止损）

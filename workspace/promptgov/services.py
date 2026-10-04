@@ -1,4 +1,5 @@
-"""服务层：模板版本治理、评估证据、审批、原子发布/回滚、线上调用、重演。"""
+"""服务层：模板版本治理、评估证据、审批（有效期/主动撤销）、原子发布/回滚、
+线上调用（授权时刻重确认）、重演（按授权快照复查）。"""
 from __future__ import annotations
 
 import json
@@ -295,30 +296,161 @@ def run_evaluation(run_id: str, actor: str = "evaluator") -> dict:
 
 # ================================================================ 审批
 
-def approve(version_id: str, kind: str, approver: str, decision: str,
-            reason: str) -> dict:
+# 有效期时间文本归一化：接受 "YYYY-MM-DDTHH:MM(:SS)" 与
+# "YYYY-MM-DD HH:MM(:SS)"（可选时区后缀，按 UTC 处理，与 datetime('now') 同格式）。
+def _normalize_valid_time(raw: Any, field: str) -> str | None:
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str):
+        raise DomainError(f"{field} 必须是字符串时间（YYYY-MM-DD HH:MM 或 ISO8601）")
+    s = raw.strip().replace("T", " ").rstrip("Z")
+    # 去掉可能的时区偏移后缀（演示/测试按 UTC 提供）
+    s = s.split("+")[0].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    raise DomainError(f"{field} 时间格式无法解析：{raw!r}（示例：2026-10-04 18:30）")
+
+
+def _db_now(c=None) -> str:
+    return (c or get_conn()).execute("SELECT datetime('now') AS t").fetchone()["t"]
+
+
+def _effective_at(row, at: str) -> bool:
+    """审批在时刻 at（UTC 'YYYY-MM-DD HH:MM:SS'）是否有效：仅 approved、未撤销，
+    且 [valid_from, valid_until] 闭区间覆盖 at。两端 NULL = 该侧不设限。
+
+    旧永久审批（两列 NULL、revoked=0）恒为有效——天然兼容。
+    """
+    if row["decision"] != "approved" or int(row["revoked"] or 0):
+        return False
+    vf = row["valid_from"]
+    vu = row["valid_until"]
+    if vf and at < vf:
+        return False
+    if vu and at > vu:  # 闭区间：at == valid_until 的那一秒仍有效（恰好到期才失效）
+        return False
+    return True
+
+
+def _approval_live_state(row: dict, now: str | None = None) -> dict:
+    """页面/API 展示用状态：active / not_yet / expired / revoked / rejected。"""
+    now = now or _db_now()
+    if row["decision"] != "approved":
+        state = "rejected"
+    elif int(row.get("revoked") or 0):
+        state = "revoked"
+    elif row.get("valid_from") and now < row["valid_from"]:
+        state = "not_yet"
+    elif row.get("valid_until") and now > row["valid_until"]:
+        state = "expired"
+    else:
+        state = "active"
+    remaining_seconds = None
+    if state == "active" and row.get("valid_until"):
+        c = get_conn()
+        remaining_seconds = c.execute(
+            "SELECT CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER) AS s",
+            (row["valid_until"], now)).fetchone()["s"]
+    if state == "not_yet":
+        c = get_conn()
+        remaining_seconds = -int(c.execute(
+            "SELECT CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER) AS s",
+            (now, row["valid_from"])).fetchone()["s"])
+    return {"state": state, "remaining_seconds": remaining_seconds}
+
+
+def approve(version_id: str, kind: str, approver: str, decision: str, reason: str,
+            valid_from: Any = None, valid_until: Any = None,
+            granted_tools: list[str] | None = None) -> dict:
     """审批。kind=release 发布审批；kind=tool_expansion 权限扩大专项审批。
 
-    工具权限相对线上扩大时，必须持有一张针对该扩大集合的 tool_expansion 审批。
+    tool_expansion 可设置有效期（valid_from/valid_until，UTC，闭区间；两端留空 =
+    旧的永久审批）。release 审批不做有效期与撤销控制，传入的有效期被忽略。
+    granted_tools 显式指定本审批覆盖的工具集合，默认覆盖该版本当前全部工具；
+    门禁要求存在覆盖**候选新增全部工具**的有效审批，只覆盖部分工具不通过。
     """
     v = _version_row(version_id)
     if kind not in ("release", "tool_expansion"):
         raise DomainError("审批类型必须是 release 或 tool_expansion")
     if decision not in ("approved", "rejected"):
         raise DomainError("decision 必须是 approved/rejected")
-    tools = _loads(v["tool_permissions"])
+    tools = sorted(granted_tools) if granted_tools is not None else _loads(v["tool_permissions"])
+    vf = vu = None
+    if kind == "tool_expansion" and decision == "approved":
+        vf = _normalize_valid_time(valid_from, "valid_from")
+        vu = _normalize_valid_time(valid_until, "valid_until")
+        if vf and vu and not (vf <= vu):
+            raise DomainError("生效时刻必须不晚于失效时刻")
     approval_id = _uid("appr")
     with write_tx() as c:
         c.execute(
             """INSERT INTO approvals(approval_id,version_id,kind,decision,approver,reason,
-               granted_tools) VALUES (?,?,?,?,?,?,?)""",
+               granted_tools,valid_from,valid_until) VALUES (?,?,?,?,?,?,?,?,?)""",
             (approval_id, version_id, kind, decision, approver, reason,
-             json.dumps(tools, ensure_ascii=False)))
+             json.dumps(tools, ensure_ascii=False), vf, vu))
         if kind == "release" and decision == "approved":
             c.execute("UPDATE versions SET status='approved' WHERE version_id=? "
                       "AND status NOT IN ('active','superseded','abandoned')", (version_id,))
+        if kind == "tool_expansion" and decision == "approved":
+            c.execute(
+                """INSERT INTO approval_events(event_id,approval_id,version_id,kind,actor,
+                   detail,valid_from,valid_until,approval_version)
+                   VALUES (?,?,?, 'grant', ?,?,?,?, 1)""",
+                (_uid("aev"), approval_id, version_id, approver,
+                 f"granted_tools={tools} {reason}", vf, vu))
+        window = ("永久有效" if not (vf or vu) else
+                  f"{vf or '立即'} ~ {vu or '永久'}")
         audit(approver, f"approval.{kind}.{decision}", "version", version_id,
-              f"{reason} tools={tools}")
+              f"{reason} tools={tools} window={window} approval={approval_id}")
+    return get_approval(approval_id)
+
+
+def revoke_approval(approval_id: str, expected_version: int, actor: str,
+                    reason: str = "") -> dict:
+    """主动撤销一张 tool_expansion 审批（乐观锁版本号 CAS）。
+
+    撤销行保留（decision 仍为 approved），只追加撤销标记与事件；历史放行结论按
+    调用当时保存的授权快照复查，不被改写。expected_version 不匹配即 409。
+    release 审批不支持撤销（用新的审批记录表达变更）。
+    """
+    expected_version = int(expected_version)
+    with write_tx() as c:
+        row = c.execute("SELECT * FROM approvals WHERE approval_id=?",
+                        (approval_id,)).fetchone()
+        if not row:
+            raise NotFound(f"审批不存在: {approval_id}")
+        if row["kind"] != "tool_expansion":
+            raise DomainError("release 审批不支持主动撤销（如需变更请提交新的审批）")
+        if row["decision"] != "approved":
+            raise Conflict("被拒绝的审批无需撤销")
+        if int(row["revoked"] or 0):
+            raise Conflict("审批已撤销，不能重复撤销（如需恢复请重新审批）")
+        if int(row["approval_version"]) != expected_version:
+            raise Conflict(
+                f"并发冲突：审批版本已变化（期望 {expected_version}，"
+                f"当前 {row['approval_version']}），撤销中止（CAS 失败）")
+        cur = c.execute(
+            """UPDATE approvals SET revoked=1, revoked_at=datetime('now'), revoked_by=?,
+               revoke_reason=?, approval_version=approval_version+1
+               WHERE approval_id=? AND revoked=0 AND approval_version=?""",
+            (actor, reason, approval_id, expected_version))
+        if cur.rowcount != 1:
+            raise Conflict("并发冲突：审批已被并发撤销（CAS 失败）")
+        c.execute(
+            """INSERT INTO approval_events(event_id,approval_id,version_id,kind,actor,
+               detail,valid_from,valid_until,approval_version)
+               VALUES (?,?,?, 'revoke', ?,?,?,?,?)""",
+            (_uid("aev"), approval_id, row["version_id"], actor,
+             f"主动撤销：{reason}", row["valid_from"], row["valid_until"],
+             expected_version + 1))
+        audit(actor, "approval.tool_expansion.revoke", "approval", approval_id,
+              f"version={row['version_id']} reason={reason} "
+              f"version {expected_version} -> {expected_version + 1}")
     return get_approval(approval_id)
 
 
@@ -327,7 +459,10 @@ def get_approval(approval_id: str) -> dict:
                            (approval_id,)).fetchone()
     if not r:
         raise NotFound(approval_id)
-    return dict(r)
+    d = dict(r)
+    d.update(_approval_live_state(d))
+    d["granted_tools"] = _loads(d["granted_tools"])
+    return d
 
 
 def list_approvals(version_id: str | None = None) -> list[dict]:
@@ -336,7 +471,27 @@ def list_approvals(version_id: str | None = None) -> list[dict]:
                                   (version_id,))
     else:
         rows = get_conn().execute("SELECT * FROM approvals ORDER BY created_at DESC")
-    return [dict(r) for r in rows.fetchall()]
+    out = []
+    for r in rows.fetchall():
+        d = dict(r)
+        d.update(_approval_live_state(d))
+        d["granted_tools"] = _loads(d["granted_tools"])
+        out.append(d)
+    return out
+
+
+def list_approval_events(approval_id: str | None = None,
+                         version_id: str | None = None) -> list[dict]:
+    q = "SELECT * FROM approval_events"
+    clauses, args = [], []
+    if approval_id:
+        clauses.append("approval_id=?"); args.append(approval_id)
+    if version_id:
+        clauses.append("version_id=?"); args.append(version_id)
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY datetime(created_at) DESC, event_id DESC"
+    return [dict(r) for r in get_conn().execute(q, tuple(args)).fetchall()]
 
 
 def _latest_release_approval(c, version_id: str):
@@ -345,16 +500,23 @@ def _latest_release_approval(c, version_id: str):
         "ORDER BY created_at DESC LIMIT 1", (version_id,)).fetchone()
 
 
-def _has_expansion_approval(c, version_id: str, granted_tools: list) -> bool:
-    """权限扩大审批必须覆盖当前全部工具（granted_tools 超集）。"""
-    need = set(granted_tools)
+def _covering_expansion_approval(c, version_id: str, needed_tools: list, at: str):
+    """返回在时刻 at 覆盖 needed_tools 全部工具、且当时有效的 tool_expansion 审批行；
+    没有则 None。判定依据：approved / 未撤销 / 有效期闭区间覆盖 at / 工具超集。
+
+    旧永久审批（valid_from/valid_until 均 NULL、未撤销）在任何时刻有效。
+    """
+    need = set(needed_tools)
     rows = c.execute(
-        "SELECT granted_tools FROM approvals WHERE version_id=? AND kind='tool_expansion' "
-        "AND decision='approved'", (version_id,)).fetchall()
+        "SELECT * FROM approvals WHERE version_id=? AND kind='tool_expansion' "
+        "AND decision='approved' AND revoked=0 ORDER BY created_at DESC",
+        (version_id,)).fetchall()
     for r in rows:
-        if need <= set(_loads(r["granted_tools"])):
-            return True
-    return False
+        if need <= set(_loads(r["granted_tools"])) and _effective_at(r, at):
+            return r
+    return None
+
+
 
 
 # ================================================================ 发布 / 回滚（原子）
@@ -392,19 +554,24 @@ def _promotion_checks(c, family_id: str, version_id: str, expected_active: str |
         raise Conflict("缺少通过的发布审批")
 
     # 3) 权限扩大必须有专项审批。首发（线上无版本）不算"扩大"；之后以版本创建时
-    #    相对线上基线计算的 permission_expanded 为准，并在发布当下再复核一次。
+    #    相对线上基线计算的 permission_expanded 为准，并在发布当下按**业务请求
+    #    发生时刻**重新确认授权仍有效（未撤销、在有效期内、覆盖候选全部工具）。
     cur_active = family["active_version_id"]
     baseline = None
     if cur_active:
         baseline = _loads(c.execute(
             "SELECT tool_permissions FROM versions WHERE version_id=?",
             (cur_active,)).fetchone()["tool_permissions"])
-    expands = core.permission_grew(baseline, _loads(v["tool_permissions"]))
+    cand_tools = _loads(v["tool_permissions"])
+    expands = core.permission_grew(baseline, cand_tools)
     if expands:
-        if not _has_expansion_approval(c, version_id, _loads(v["tool_permissions"])):
-            added = sorted(set(_loads(v["tool_permissions"])) - set(baseline or []))
+        at = _db_now(c)
+        added = sorted(set(cand_tools) - set(baseline or []))
+        if not _covering_expansion_approval(c, version_id, cand_tools, at):
             raise Conflict(
-                f"工具权限相对线上扩大 {added}，必须重新走工具权限扩大审批（tool_expansion）")
+                f"工具权限相对线上扩大 {added}，但业务时刻 {at} 不存在覆盖全部新增"
+                f"工具的有效 tool_expansion 审批（缺失/未生效/已到期/已撤销/只覆盖部分），"
+                f"发布中止；线上指针未变化")
     return family, v, run, baseline or []
 
 
@@ -572,12 +739,15 @@ def create_rollout(family_id: str, candidate_version_id: str, weight: int,
             "SELECT tool_permissions FROM versions WHERE version_id=?",
             (f["active_version_id"],)).fetchone()["tool_permissions"])
         cand_tools = _loads(v["tool_permissions"])
-        if core.permission_grew(base_tools, cand_tools) and \
-                not _has_expansion_approval(c, candidate_version_id, cand_tools):
+        if core.permission_grew(base_tools, cand_tools):
+            at = _db_now(c)
             added = sorted(set(cand_tools) - set(base_tools))
-            raise Conflict(
-                f"候选构件新增可调用工具 {added}，必须存在专项授权（tool_expansion）"
-                f"后才允许放量：首个请求命中前授权必须就位")
+            if not _covering_expansion_approval(c, candidate_version_id, cand_tools, at):
+                raise Conflict(
+                    f"候选构件新增可调用工具 {added}，但业务时刻 {at} 不存在覆盖全部新增"
+                    f"工具的有效 tool_expansion 审批（缺失/尚未生效/已到期/已撤销/"
+                    f"只覆盖部分工具）：首个请求命中前授权必须就位。建批中止，"
+                    f"已生效路由表未变化")
         c.execute(
             """INSERT INTO rollouts(rollout_id,family_id,candidate_version_id,
                base_version_id,weight,status,generation,created_by)
@@ -687,6 +857,26 @@ def complete_rollout(rollout_id: str, expected_generation: int, actor: str) -> d
         if family["active_version_id"] != r["base_version_id"]:
             raise Conflict("线上指针已偏离批次基线（期间发生了一步切换），批次不能完成；"
                            "请撤销该批次后重新评估")
+        # 发布竞争：完成即候选转正（要移动线上指针），必须在同一事务内按业务请求
+        # 发生时刻重新确认 tool_expansion 授权仍有效且覆盖候选全部工具；审批在放量
+        # 期间到期/被撤销时完成被拒，指针与放量状态均不变。
+        cand = c.execute("SELECT * FROM versions WHERE version_id=?",
+                         (r["candidate_version_id"],)).fetchone()
+        base_tools = _loads(c.execute(
+            "SELECT tool_permissions FROM versions WHERE version_id=?",
+            (r["base_version_id"],)).fetchone()["tool_permissions"])
+        cand_tools = _loads(cand["tool_permissions"])
+        at = _db_now(c)
+        covering = None
+        if core.permission_grew(base_tools, cand_tools):
+            covering = _covering_expansion_approval(
+                c, r["candidate_version_id"], cand_tools, at)
+            if not covering:
+                added = sorted(set(cand_tools) - set(base_tools))
+                raise Conflict(
+                    f"完成时重新确认授权失败：候选新增工具 {added} 在业务时刻 {at} "
+                    f"没有有效且全覆盖的 tool_expansion 审批（已到期/已撤销/只覆盖部分），"
+                    f"候选转正中止；线上指针与放量状态均未变化")
         _cas_transition(c, rollout_id, expected_generation,
                         "status='completed', weight=100", (), ROLLOUT_OPEN)
         c.execute("UPDATE families SET active_version_id=?, updated_at=datetime('now') "
@@ -860,10 +1050,6 @@ def window_stats(rollout_id: str, window_id: str) -> dict:
     if not w:
         raise NotFound(f"统计窗口不存在: {window_id}")
     return _window_stats(conn, dict(w), _db_now(conn))
-
-
-def _db_now(c) -> str:
-    return c.execute("SELECT datetime('now') AS t").fetchone()["t"]
 
 
 # ---------------------------------------------------------------- 回执入账 / 触发
@@ -1201,6 +1387,48 @@ def stoploss_overview(rollout_id: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 授权时刻重确认（候选命中）
+
+def _expansion_snapshot(c, rollout, base_tools: list, cand_row, at: str) -> dict | None:
+    """候选命中时按业务时刻 at 重新确认授权，返回放行授权快照；未通过返回 None。
+
+    快照记录：业务时刻、候选相对基线新增的工具集合、命中的审批（id/版本号/
+    有效期/覆盖工具）。调用复查只按此快照复查，审批随后到期/撤销不改写结论。
+    """
+    cand_tools = _loads(cand_row["tool_permissions"])
+    added = sorted(set(cand_tools) - set(base_tools))
+    snap = {
+        "check": "tool_expansion",
+        "checked_at": at,
+        "rollout_id": rollout["rollout_id"],
+        "rollout_generation": rollout["generation"],
+        "candidate_version_id": cand_row["version_id"],
+        "candidate_tools": sorted(cand_tools),
+        "base_tools": sorted(base_tools),
+        "added_tools": added,
+        "expanded": bool(added),
+    }
+    if not added:
+        snap.update({"result": "not_needed", "approval_id": None})
+        return snap
+    covering = _covering_expansion_approval(
+        c, cand_row["version_id"], cand_tools, at)
+    if not covering:
+        return None
+    snap.update({
+        "result": "covered",
+        "approval_id": covering["approval_id"],
+        "approval_version": int(covering["approval_version"]),
+        "approver": covering["approver"],
+        "granted_tools": _loads(covering["granted_tools"]),
+        "valid_from": covering["valid_from"],
+        "valid_until": covering["valid_until"],
+        "revoked_at_call": int(covering["revoked"] or 0),
+        "approval_created_at": covering["created_at"],
+    })
+    return snap
+
+
 # ================================================================ 线上调用
 
 def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = None,
@@ -1211,8 +1439,9 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
     - 批次放量中且携带 routing_key：稳定散列分桶，bucket < weight 走候选构件，
       否则走当前构件；同一代次内同一 key 的决定不漂移；
     - 批次冻结中 / 未携带 routing_key：一律走当前构件；
-    - 命中候选且候选相对线上新增可调用工具时，当场复核专项授权，缺失即拒绝
-      （事务回滚，已生效路由表不变）。
+    - 命中候选且候选相对线上新增可调用工具时，按**业务请求发生时刻**当场重新确认
+      专项授权（存在、已生效、未失效、未撤销、覆盖候选全部工具），任一不满足即
+      拒绝（事务回滚，已生效路由表与放量状态均不变），并在调用记录固化授权快照。
     """
     routing_key = (routing_key or "").strip() or None
     with write_tx() as c:  # 立即取锁，保证读到的指针/批次与版本快照一致
@@ -1223,9 +1452,13 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
         if not active_id:
             raise Conflict("该模板族尚未发布任何版本，拒绝线上流量")
 
+        # 业务请求发生时刻：同一事务内 datetime('now') 恒定，门禁判定与随后固化
+        # 的 requests.created_at 严格使用同一时刻（有效期边界可精确断言）。
+        at = _db_now(c)
         hit_version_id = active_id
         hit_rollout_id = None
         hit_generation = None
+        auth_snapshot = None
         rollout = c.execute(
             "SELECT * FROM rollouts WHERE family_id=? AND status IN ('ramping','frozen') "
             "ORDER BY created_at DESC LIMIT 1", (family_id,)).fetchone()
@@ -1236,13 +1469,16 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                                  (rollout["candidate_version_id"],)).fetchone()
                 base = c.execute("SELECT * FROM versions WHERE version_id=?",
                                  (active_id,)).fetchone()
-                if core.permission_grew(_loads(base["tool_permissions"]),
-                                        _loads(cand["tool_permissions"])) and \
-                        not _has_expansion_approval(
-                            c, cand["version_id"], _loads(cand["tool_permissions"])):
+                auth_snapshot = _expansion_snapshot(
+                    c, rollout, _loads(base["tool_permissions"]), cand, at)
+                if auth_snapshot is None:
+                    added = sorted(set(_loads(cand["tool_permissions"]))
+                                   - set(_loads(base["tool_permissions"])))
                     raise Conflict(
-                        "候选构件新增可调用工具但专项授权（tool_expansion）缺失，"
-                        "首个命中请求被拒绝；已生效路由表未变化")
+                        f"候选构件新增可调用工具 {added}，但业务时刻 {at} 的专项授权"
+                        f"（tool_expansion）不满足：不存在/尚未生效/已到期/已撤销/"
+                        f"未覆盖全部新增工具。首个命中请求被拒绝；已生效路由表与"
+                        f"放量状态均未变化")
                 hit_version_id = cand["version_id"]
                 hit_rollout_id = rollout["rollout_id"]
                 hit_generation = rollout["generation"]
@@ -1270,28 +1506,34 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
     params_json = json.dumps(params, sort_keys=True, ensure_ascii=False)
     params_fp = core.params_fingerprint(params)
     rid = request_id or _uid("req")
+    snap_json = json.dumps(auth_snapshot, sort_keys=True, ensure_ascii=False) \
+        if auth_snapshot else ""
 
     with write_tx() as c:
         c.execute(
             """INSERT INTO requests(request_id,family_id,version_id,model_id,input_digest,
                inputs_json,rendered_prompt,output_digest,output,template_hash_at_call,
-               routing_key,rollout_id,rollout_generation,params_json,params_fingerprint)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               routing_key,rollout_id,rollout_generation,params_json,params_fingerprint,
+               auth_snapshot_json,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (rid, family_id, hit_version_id, model_id, inp_digest,
              json.dumps(effective, ensure_ascii=False, sort_keys=True), prompt,
              out_digest, output, v["content_hash"], routing_key, hit_rollout_id,
-             hit_generation, params_json, params_fp))
+             hit_generation, params_json, params_fp, snap_json, at))
         audit(actor, "invoke", "request", rid,
               f"family={family_id} version={hit_version_id} model={model_id} "
               f"input={inp_digest[:12]} output={out_digest[:12]}"
               + (f" rollout={hit_rollout_id}@gen{hit_generation} key={routing_key}"
-                 if hit_rollout_id else ""))
+                 if hit_rollout_id else "")
+              + (f" auth={auth_snapshot['result']}:{auth_snapshot.get('approval_id')}"
+                 if auth_snapshot else ""))
     return {
         "request_id": rid, "family_id": family_id, "version_id": hit_version_id,
         "model_id": model_id, "input_digest": inp_digest, "template_hash": v["content_hash"],
         "output_digest": out_digest, "rendered_prompt": prompt, "output": _loads(output),
         "routing_key": routing_key, "rollout_id": hit_rollout_id,
         "rollout_generation": hit_generation, "params_fingerprint": params_fp,
+        "auth_snapshot": auth_snapshot,
     }
 
 
@@ -1301,6 +1543,52 @@ def get_request(request_id: str) -> dict:
     if not r:
         raise NotFound(f"请求不存在: {request_id}")
     return dict(r)
+
+
+def recheck_request_auth(request_id: str) -> dict:
+    """按调用当时保存的授权快照复查该请求的工具扩权门禁结论。
+
+    复查只基于快照行内固化的事实（业务时刻、命中的审批版本号、有效期、覆盖工具），
+    **不读取审批行的当前状态**——审批随后到期或主动撤销都不改写当年的放行结论；
+    同时附上该审批的**当前**状态仅作展示（"当年有效、现已撤销"之类的对照）。
+
+    - 旧调用（无授权快照，auth_snapshot_json 为空）：按旧永久审批兼容，
+      结论恒为 legacy_pass，不随后续到期/撤销变化；
+    - 快照 result=not_needed：候选未新增工具，无需专项授权；
+    - result=covered：在快照业务时刻重新推演该审批当时是否满足全部条件，
+      结论恒为 pass（快照即门禁放行的证据）。
+    """
+    req = get_request(request_id)
+    raw = req.get("auth_snapshot_json") or ""
+    if not raw:
+        return {"request_id": request_id, "conclusion": "legacy_pass",
+                "reason": "旧调用无授权快照：按当时旧永久审批兼容，不因随后到期/撤销改写",
+                "snapshot": None, "current": None}
+    snap = _loads(raw)
+    result = snap.get("result")
+    if result == "not_needed":
+        conclusion = "not_needed"
+    elif result == "covered":
+        conclusion = "pass"
+    else:
+        conclusion = "unknown"
+    current = None
+    aid = snap.get("approval_id")
+    if aid:
+        row = get_conn().execute("SELECT * FROM approvals WHERE approval_id=?",
+                                 (aid,)).fetchone()
+        if row:
+            d = dict(row)
+            current = _approval_live_state(d)
+            current.update({
+                "approval_id": aid,
+                "valid_from": d["valid_from"], "valid_until": d["valid_until"],
+                "approval_version_now": int(d["approval_version"]),
+                "granted_tools": _loads(d["granted_tools"]),
+            })
+    return {"request_id": request_id, "conclusion": conclusion,
+            "reason": "按调用时保存的授权快照复查；快照结论不因审批随后到期/撤销而改写",
+            "snapshot": snap, "current": current}
 
 
 # ================================================================ 重演

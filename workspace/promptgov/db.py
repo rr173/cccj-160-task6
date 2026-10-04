@@ -53,6 +53,31 @@ CREATE TABLE IF NOT EXISTS approvals (
     approver         TEXT NOT NULL,
     reason           TEXT NOT NULL DEFAULT '',
     granted_tools    TEXT NOT NULL DEFAULT '[]', -- 审批时确认的权限快照
+    -- 有效期（UTC，datetime('now') 文本，可直接字符串比较；两端闭区间）：
+    -- 旧审批与未设置者两列均为 NULL = 永久有效，继续兼容。
+    valid_from       TEXT,                  -- 生效时刻（NULL=立即生效）
+    valid_until      TEXT,                  -- 失效时刻（NULL=永久）
+    -- 主动撤销：撤销行保留（decision 仍为 approved，不改写历史），以版本号做并发控制。
+    revoked          INTEGER NOT NULL DEFAULT 0,
+    revoked_at       TEXT,
+    revoked_by       TEXT,
+    revoke_reason    TEXT NOT NULL DEFAULT '',
+    approval_version INTEGER NOT NULL DEFAULT 1, -- 乐观锁：撤销 CAS
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 审批生命周期事件（授予 / 撤销），页面与证据包中的"历史记录"以此为准；
+-- 审批行本身不可变更新（除受控撤销标记），事件只追加。
+CREATE TABLE IF NOT EXISTS approval_events (
+    event_id         TEXT PRIMARY KEY,
+    approval_id      TEXT NOT NULL REFERENCES approvals(approval_id),
+    version_id       TEXT NOT NULL REFERENCES versions(version_id),
+    kind             TEXT NOT NULL,         -- grant / revoke
+    actor            TEXT NOT NULL,
+    detail           TEXT NOT NULL DEFAULT '',
+    valid_from       TEXT,
+    valid_until      TEXT,
+    approval_version INTEGER NOT NULL,     -- 事件发生后的版本号
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -119,6 +144,10 @@ CREATE TABLE IF NOT EXISTS requests (
     rollout_generation INTEGER,               -- 命中时的批次代次
     params_json      TEXT NOT NULL DEFAULT '',   -- 调用时推理配置快照
     params_fingerprint TEXT NOT NULL DEFAULT '', -- 推理配置指纹
+    -- 命中候选新增工具时的授权快照：当时用哪张 tool_expansion 审批通过门禁、
+    -- 覆盖了候选的哪些新增工具、审批版本号与有效期。复核（replay）只按此快照
+    -- 复查，不因审批随后到期/撤销而改写当年放行结论；旧调用为空=旧永久授权兼容。
+    auth_snapshot_json TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -294,6 +323,8 @@ CREATE INDEX IF NOT EXISTS idx_windows_rollout ON stoploss_windows(rollout_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_window ON feedback_receipts(window_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON feedback_receipts(rollout_id);
 CREATE INDEX IF NOT EXISTS idx_triggers_rollout ON stoploss_triggers(rollout_id);
+CREATE INDEX IF NOT EXISTS idx_approval_events_approval ON approval_events(approval_id);
+CREATE INDEX IF NOT EXISTS idx_approval_events_version ON approval_events(version_id);
 """
 
 # 老库增量迁移：requests 的放量证据列（新库已由 _SCHEMA 建全）
@@ -304,6 +335,20 @@ _REQUESTS_NEW_COLUMNS = {
     "params_json": "ALTER TABLE requests ADD COLUMN params_json TEXT NOT NULL DEFAULT ''",
     "params_fingerprint":
         "ALTER TABLE requests ADD COLUMN params_fingerprint TEXT NOT NULL DEFAULT ''",
+    "auth_snapshot_json":
+        "ALTER TABLE requests ADD COLUMN auth_snapshot_json TEXT NOT NULL DEFAULT ''",
+}
+
+# 老库增量迁移：approvals 的有效期 / 主动撤销列（旧审批两列 NULL 即永久有效）
+_APPROVALS_NEW_COLUMNS = {
+    "valid_from": "ALTER TABLE approvals ADD COLUMN valid_from TEXT",
+    "valid_until": "ALTER TABLE approvals ADD COLUMN valid_until TEXT",
+    "revoked": "ALTER TABLE approvals ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+    "revoked_at": "ALTER TABLE approvals ADD COLUMN revoked_at TEXT",
+    "revoked_by": "ALTER TABLE approvals ADD COLUMN revoked_by TEXT",
+    "revoke_reason": "ALTER TABLE approvals ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''",
+    "approval_version":
+        "ALTER TABLE approvals ADD COLUMN approval_version INTEGER NOT NULL DEFAULT 1",
 }
 
 # 老库增量迁移：rollouts 的自动止损标记列
@@ -336,6 +381,10 @@ def init_db() -> None:
             rcols = {r["name"] for r in conn.execute("PRAGMA table_info(rollouts)")}
             for col, ddl in _ROLLOUTS_NEW_COLUMNS.items():
                 if col not in rcols:
+                    conn.execute(ddl)
+            acols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
+            for col, ddl in _APPROVALS_NEW_COLUMNS.items():
+                if col not in acols:
                     conn.execute(ddl)
             conn.commit()
         finally:

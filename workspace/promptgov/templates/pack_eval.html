@@ -35,18 +35,43 @@
   </div>
 
   <div class="card">
-    <h2>审批记录（归档快照）</h2>
+    <h2>审批记录（归档快照 · 切点状态）</h2>
     <table>
+      <thead><tr><th>类型</th><th>结论/切点状态</th><th>审批人</th><th>覆盖工具与有效期</th></tr></thead>
       <tbody>
       {% for a in approvals %}
-        <tr><td><span class="chip">{{ a.kind }}</span></td>
+        <tr><td><span class="chip">{{ a.kind }}</span><div class="small">{{ a.created_at }}</div></td>
           <td>{% if a.decision == 'approved' %}<span class="ok">{{ a.decision }}</span>
-            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}</td>
-          <td class="small">{{ a.approver }}</td>
-          <td class="small mut">{{ a.reason }}</td>
-          <td class="small">{{ a.created_at }}</td></tr>
+            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}
+            {% if a.decision == 'approved' %}
+              {% if a.state == 'active' %}<div class="badge b-active">切点时生效中</div>
+              {% elif a.state == 'revoked' %}<div class="badge b-failed_eval">切点时已撤销</div>
+              {% elif a.state == 'expired' %}<div class="badge b-failed_eval">切点时已到期</div>
+              {% endif %}
+            {% endif %}</td>
+          <td class="small">{{ a.approver }}<div class="small mut">{{ a.reason }}</div></td>
+          <td class="small">
+            {% if a.is_expansion %}<div class="mono">{{ a.granted_tools }}</div>
+            <div class="small mut">{{ a.window_text }}</div>
+            {% else %}<span class="mut">—（release 不设有效期）</span>{% endif %}</td></tr>
       {% endfor %}
-      {% if not approvals %}<tr><td colspan="5" class="small mut">无审批记录。</td></tr>{% endif %}
+      {% if not approvals %}<tr><td colspan="4" class="small mut">无审批记录。</td></tr>{% endif %}
+      </tbody>
+    </table>
+    <h3>审批历史（授予 / 撤销事件，切点固化）</h3>
+    <table>
+      <thead><tr><th>时间</th><th>事件</th><th>操作人</th><th>审批</th><th>有效期</th><th>版本</th></tr></thead>
+      <tbody>
+      {% for e in approval_events %}
+        <tr><td class="small">{{ e.created_at }}</td>
+          <td>{% if e.kind == 'grant' %}<span class="badge b-approved">授予</span>
+            {% else %}<span class="badge b-failed_eval">撤销</span>{% endif %}</td>
+          <td class="small">{{ e.actor }}</td>
+          <td class="small mono">{{ e.approval_id }}</td>
+          <td class="small mut">{{ e.window_text }}</td>
+          <td class="small mono">v{{ e.approval_version }}</td></tr>
+      {% endfor %}
+      {% if not approval_events %}<tr><td colspan="6" class="small mut">无审批事件。</td></tr>{% endif %}
       </tbody>
     </table>
   </div>
